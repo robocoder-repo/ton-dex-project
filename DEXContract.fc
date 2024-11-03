@@ -1,0 +1,294 @@
+#pragma version >=0.2.0;
+
+;; Constants
+const int MIN_TON_FOR_STORAGE = 50000000; ;; 0.05 TON
+const slice ORACLE_ADDRESS = "EQD__________________________________________"; ;; Replace with actual oracle address
+const slice TOKEN_ADDRESS = "EQD__________________________________________"; ;; Replace with actual token address
+
+;; Error codes
+const int ERROR_ACCESS_DENIED = 100;
+const int ERROR_INVALID_ORDER = 101;
+const int ERROR_INSUFFICIENT_FUNDS = 102;
+const int ERROR_ORDER_NOT_FOUND = 103;
+const int ERROR_INVALID_AMOUNT = 104;
+
+;; Op codes
+const int OP_PLACE_ORDER = 1;
+const int OP_CANCEL_ORDER = 2;
+const int OP_EXECUTE_ORDER = 3;
+const int OP_DEPOSIT = 4;
+const int OP_WITHDRAW = 5;
+
+;; Token transfer op codes
+const int OP_TRANSFER_NOTIFICATION = 0x7362d09c;
+const int OP_TRANSFER = 0xf8a7ea5;
+
+;; Storage
+global cell orders;
+global int last_order_id;
+global cell balances; ;; user_address -> (ton_balance, token_balance)
+
+;; Initialize storage
+() load_data() impure {
+    var ds = get_data().begin_parse();
+    orders = ds~load_dict();
+    last_order_id = ds~load_uint(32);
+    balances = ds~load_dict();
+    ds.end_parse();
+}
+
+;; Save storage
+() save_data() impure {
+    set_data(begin_cell()
+        .store_dict(orders)
+        .store_uint(last_order_id, 32)
+        .store_dict(balances)
+        .end_cell());
+}
+
+;; Get methods
+int get_order_count() method_id {
+    load_data();
+    return last_order_id;
+}
+
+(slice, int, int, int, int) get_order(int order_id) method_id {
+    load_data();
+    (cell order_data, int success) = orders.udict_get?(256, order_id);
+    throw_unless(ERROR_ORDER_NOT_FOUND, success);
+    return order_data.begin_parse().preload_ref().begin_parse().preload_tuple();
+}
+
+(int, int) get_balance(slice address) method_id {
+    load_data();
+    (cell balance_data, int success) = balances.udict_get?(267, address);
+    if (success) {
+        return balance_data.begin_parse().preload_ref().begin_parse().preload_tuple();
+    } else {
+        return (0, 0);
+    }
+}
+
+;; Internal: Update user balance
+() update_balance(slice address, int ton_delta, int token_delta) impure {
+    (int ton_balance, int token_balance) = get_balance(address);
+    ton_balance += ton_delta;
+    token_balance += token_delta;
+    throw_unless(ERROR_INSUFFICIENT_FUNDS, ton_balance >= 0);
+    throw_unless(ERROR_INSUFFICIENT_FUNDS, token_balance >= 0);
+    balances~udict_set(267, address, begin_cell()
+        .store_coins(ton_balance)
+        .store_coins(token_balance)
+        .end_cell());
+}
+
+;; Internal: Place a new order
+() place_order(slice sender_address, int is_limit, int price, int amount, int is_buy) impure {
+    ;; Check and update balance
+    int required_balance = is_buy ? muldiv(amount, price, 1000000000) : amount;
+    (int ton_balance, int token_balance) = get_balance(sender_address);
+    if (is_buy) {
+        throw_unless(ERROR_INSUFFICIENT_FUNDS, ton_balance >= required_balance);
+        update_balance(sender_address, -required_balance, 0);
+    } else {
+        throw_unless(ERROR_INSUFFICIENT_FUNDS, token_balance >= required_balance);
+        update_balance(sender_address, 0, -required_balance);
+    }
+
+    last_order_id += 1;
+    orders~udict_set(256, last_order_id, begin_cell()
+        .store_slice(sender_address)
+        .store_uint(is_limit, 1)
+        .store_coins(price)
+        .store_coins(amount)
+        .store_uint(is_buy, 1)
+        .end_cell());
+}
+
+;; Internal: Cancel an existing order
+() cancel_order(slice sender_address, int order_id) impure {
+    (cell order_data, int success) = orders.udict_get?(256, order_id);
+    throw_unless(ERROR_ORDER_NOT_FOUND, success);
+    
+    slice order = order_data.begin_parse();
+    slice owner = order~load_msg_addr();
+    throw_unless(ERROR_ACCESS_DENIED, equal_slices(sender_address, owner));
+    
+    int is_limit = order~load_uint(1);
+    int price = order~load_coins();
+    int amount = order~load_coins();
+    int is_buy = order~load_uint(1);
+    
+    ;; Refund the locked balance
+    int refund_amount = is_buy ? muldiv(amount, price, 1000000000) : amount;
+    update_balance(sender_address, is_buy ? refund_amount : 0, is_buy ? 0 : refund_amount);
+    
+    orders~udict_delete?(256, order_id);
+}
+
+;; Internal: Execute a single order
+() execute_single_order(int order_id, slice buyer, slice seller, int amount, int execute_price) impure {
+    int ton_amount = muldiv(amount, execute_price, 1000000000);
+    
+    ;; Update balances
+    update_balance(buyer, -ton_amount, amount);
+    update_balance(seller, ton_amount, -amount);
+    
+    ;; Transfer TON to seller
+    var msg = begin_cell()
+        .store_uint(0x10, 6) ;; nobounce
+        .store_slice(seller)
+        .store_coins(ton_amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+    send_raw_message(msg, 1); ;; pay transfer fees separately
+    
+    ;; Transfer tokens to buyer
+    var token_msg = begin_cell()
+        .store_uint(0x10, 6) ;; nobounce
+        .store_slice(TOKEN_ADDRESS)
+        .store_coins(50000000) ;; 0.05 TON for gas
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(OP_TRANSFER, 32)
+        .store_uint(0, 64) ;; query id
+        .store_coins(amount)
+        .store_slice(buyer)
+        .store_slice(my_address()) ;; response destination
+        .store_uint(0, 1) ;; no custom payload
+        .store_coins(1) ;; forward amount
+        .store_uint(0, 1) ;; no forward payload
+        .end_cell();
+    send_raw_message(token_msg, 1); ;; pay transfer fees separately
+}
+
+;; Internal: Execute orders based on market price
+() execute_orders(int market_price) impure {
+    int key = -1;
+    do {
+        (key, slice cs, int f) = orders.udict_get_next?(256, key);
+        if (f) {
+            slice order = cs.begin_parse();
+            slice owner = order~load_msg_addr();
+            int is_limit = order~load_uint(1);
+            int price = order~load_coins();
+            int amount = order~load_coins();
+            int is_buy = order~load_uint(1);
+            
+            if (can_execute_order(is_limit, price, amount, is_buy, market_price)) {
+                int execute_price = is_limit ? price : market_price;
+                
+                if (is_buy) {
+                    execute_single_order(key, owner, my_address(), amount, execute_price);
+                } else {
+                    execute_single_order(key, my_address(), owner, amount, execute_price);
+                }
+                
+                orders~udict_delete?(256, key);
+            }
+        }
+    } until (~ f);
+}
+
+;; Check if an order can be executed
+int can_execute_order(int is_limit, int price, int amount, int is_buy, int market_price) {
+    if (is_limit) {
+        return is_buy ? (market_price <= price) : (market_price >= price);
+    } else { ;; stop-limit
+        return is_buy ? (market_price >= price) : (market_price <= price);
+    }
+}
+
+;; Main entry point for the contract
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+        return ();
+    }
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+    
+    load_data();
+    
+    int op = in_msg_body~load_uint(32);
+    
+    if (op == OP_PLACE_ORDER) {
+        int is_limit = in_msg_body~load_uint(1);
+        int price = in_msg_body~load_coins();
+        int amount = in_msg_body~load_coins();
+        int is_buy = in_msg_body~load_uint(1);
+        
+        ;; Check if enough value is attached for storage
+        throw_unless(ERROR_INSUFFICIENT_FUNDS, msg_value >= MIN_TON_FOR_STORAGE);
+        
+        place_order(sender_address, is_limit, price, amount, is_buy);
+    } 
+    elseif (op == OP_CANCEL_ORDER) {
+        int order_id = in_msg_body~load_uint(256);
+        cancel_order(sender_address, order_id);
+    }
+    elseif (op == OP_EXECUTE_ORDER) {
+        throw_unless(ERROR_ACCESS_DENIED, equal_slices(sender_address, ORACLE_ADDRESS));
+        int market_price = in_msg_body~load_coins();
+        execute_orders(market_price);
+    }
+    elseif (op == OP_DEPOSIT) {
+        int amount = in_msg_body~load_coins();
+        throw_unless(ERROR_INVALID_AMOUNT, amount > 0);
+        update_balance(sender_address, amount, 0);
+    }
+    elseif (op == OP_WITHDRAW) {
+        int ton_amount = in_msg_body~load_coins();
+        int token_amount = in_msg_body~load_coins();
+        throw_unless(ERROR_INVALID_AMOUNT, ton_amount >= 0);
+        throw_unless(ERROR_INVALID_AMOUNT, token_amount >= 0);
+        update_balance(sender_address, -ton_amount, -token_amount);
+        
+        ;; Transfer TON
+        if (ton_amount > 0) {
+            var msg = begin_cell()
+                .store_uint(0x10, 6) ;; nobounce
+                .store_slice(sender_address)
+                .store_coins(ton_amount)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .end_cell();
+            send_raw_message(msg, 1); ;; pay transfer fees separately
+        }
+        
+        ;; Transfer tokens
+        if (token_amount > 0) {
+            var token_msg = begin_cell()
+                .store_uint(0x10, 6) ;; nobounce
+                .store_slice(TOKEN_ADDRESS)
+                .store_coins(50000000) ;; 0.05 TON for gas
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(OP_TRANSFER, 32)
+                .store_uint(0, 64) ;; query id
+                .store_coins(token_amount)
+                .store_slice(sender_address)
+                .store_slice(my_address()) ;; response destination
+                .store_uint(0, 1) ;; no custom payload
+                .store_coins(1) ;; forward amount
+                .store_uint(0, 1) ;; no forward payload
+                .end_cell();
+            send_raw_message(token_msg, 1); ;; pay transfer fees separately
+        }
+    }
+    elseif (op == OP_TRANSFER_NOTIFICATION) {
+        ;; Assuming this is a token deposit
+        in_msg_body~load_uint(64); ;; skip query_id
+        int amount = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+        update_balance(from_address, 0, amount);
+    }
+    
+    save_data();
+}
+
+;; Get method to check if an order can be executed
+int can_execute_order(int order_id, int market_price) method_id {
+    (slice owner, int is_limit, int price, int amount, int is_buy) = get_order(order_id);
+    return can_execute_order(is_limit, price, amount, is_buy, market_price);
+}
