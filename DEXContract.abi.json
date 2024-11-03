@@ -1,0 +1,29 @@
+{
+  "ABI version": 2,
+  "version": "2.2",
+  "header": ["time", "expire"],
+  "functions": [
+    {
+      "name": "constructor",
+      "inputs": [
+        {"name": "oracle_address", "type": "address"},
+        {"name": "token_address", "type": "address"}
+      ],
+      "outputs": []
+    },
+    {
+      "name": "get_order_count",
+      "inputs": [],
+      "outputs": [
+        {"name": "count", "type": "uint256"}
+      ]
+    }
+  ],
+  "data": [],
+  "events": [],
+  "fields": [
+    {"name": "orders", "type": "cell"},
+    {"name": "last_order_id", "type": "uint256"},
+    {"name": "balances", "type": "cell"}
+  ]
+}
